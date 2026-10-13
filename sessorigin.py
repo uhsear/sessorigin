@@ -27,7 +27,8 @@ session verdict when that answer is not the new address.
         --resolved 192.0.2.10 --hosts-file hosts.txt
     python sessorigin.py polls.csv --old DBOLD --new DBNEW --out verdicts.csv --apply
 
-Nothing is written without --apply.
+Outside --self-test, nothing is written without --apply. The self-test writes
+only to a temporary directory that it removes.
 
 Exit codes: 0 every node MIGRATED (or the preflight passed), 1 at least one node
 still holds sessions on the old server (SPLIT or STAYED), 2 a file could not be
@@ -43,6 +44,7 @@ import ipaddress
 import os
 import runpy
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -176,9 +178,13 @@ def build_polls(records, old, new):
         labels.setdefault(key, rec["host_name"] or "(blank host_name)")
         poll.sessions.setdefault(key, set()).add(rec["session_id"])
     if unknown:
+        hint = ""
+        if any(s.lower() in ("", "server") for s in unknown):
+            hint = (". A blank server or a repeated header row is in the "
+                    "file: join per-round exports without their header lines")
         raise UsageError(
-            "server(s) %s are on rows but are neither --old %r nor --new %r"
-            % (", ".join(repr(s) for s in unknown), old, new))
+            "server(s) %s are on rows but are neither --old %r nor --new %r%s"
+            % (", ".join(repr(s) for s in unknown), old, new, hint))
     for role, name in (("old", old), ("new", new)):
         if role not in seen:
             raise UsageError(
@@ -297,12 +303,14 @@ def judge(host, label, polls, settle):
     elif all(not polls[r]["old"].count(host) and polls[r]["new"].count(host)
              for r in window):
         v.verdict = MIGRATED
-        v.reason = ("0 on OLD and %d on NEW in each of the last %d round(s)"
-                    % (v.final_new, settle))
+        least = min(polls[r]["new"].count(host) for r in window)
+        v.reason = ("0 on OLD and at least %d on NEW in each of the last %d "
+                    "round(s)" % (least, settle))
     else:
         v.verdict = UNSETTLED
-        v.reason = ("OLD reached zero inside the last %d round(s), not across "
-                    "all of them. Poll again" % settle)
+        v.reason = ("the last round is clean, but an earlier round of the last "
+                    "%d was not 0 on OLD with at least 1 on NEW. Poll again"
+                    % settle)
     return v
 
 
@@ -320,17 +328,33 @@ def assess(polls, labels, nodes, settle):
     return [judge(h, labels[h], polls, settle) for h in hosts]
 
 
-def gate(verdicts):
+def unjudged(polls, labels, verdicts, settle):
+    """Verdicts of the hosts in the export that --node did not name. Pure.
+
+    A host the operator left out can still hold sessions on OLD. The run must
+    not call itself migrated while the export shows one.
+    """
+    named = set(v.host for v in verdicts)
+    return [judge(h, labels[h], polls, settle)
+            for h in sorted(labels) if h not in named]
+
+
+def not_clean(rest):
+    """The unjudged verdicts that still show sessions on OLD in the window."""
+    return [v for v in rest if v.verdict in (SPLIT, STAYED, UNSETTLED)]
+
+
+def gate(verdicts, held=()):
     """Exit code: 1 sessions remain on OLD, 3 nothing certified, 0 migrated."""
     kinds = set(v.verdict for v in verdicts)
     if kinds & set([SPLIT, STAYED]):
         return 1
-    if not verdicts or kinds != set([MIGRATED]):
+    if not verdicts or kinds != set([MIGRATED]) or held:
         return 3
     return 0
 
 
-def overall(verdicts):
+def overall(verdicts, held=(), scoped=False):
     kinds = [v.verdict for v in verdicts]
     if SPLIT in kinds:
         return ("SPLIT. %d node(s) answer from both databases. This is not a "
@@ -343,14 +367,20 @@ def overall(verdicts):
     if set(kinds) != set([MIGRATED]):
         return ("NOT CERTIFIED. %d of %d node(s) cannot be called migrated."
                 % (len(kinds) - kinds.count(MIGRATED), len(kinds)))
+    if held:
+        return ("NOT CERTIFIED. %d host(s) in the export, not named by "
+                "--node, still show sessions on OLD." % len(held))
+    if scoped:
+        return ("MIGRATED. Every node named by --node is on NEW and none is "
+                "on OLD.")
     return "MIGRATED. Every node is on NEW and none is on OLD."
 
 
-def describe(verdicts, polls, old, new, settle):
+def describe(verdicts, polls, old, new, settle, held=(), scoped=False):
     rounds = sorted(polls)
     lines = ["rounds %s, OLD = %s, NEW = %s, settle %d"
              % (spans(rounds) or "none", old, new, settle)]
-    width = max([len(v.label) for v in verdicts] + [4])
+    width = max([len(v.label) for v in list(verdicts) + list(held)] + [4])
     for v in verdicts:
         lines.append("  %-*s  %-12s  %s" % (width, v.label, v.verdict,
                                             v.reason))
@@ -365,15 +395,24 @@ def describe(verdicts, polls, old, new, settle):
             lines.append("  %-*s  %-12s  %s %d round(s): %s%s"
                          % (width, "", "", lead, len(v.split_rounds),
                             spans(v.split_rounds), when))
+    if held:
+        lines.append("")
+        lines.append("In the export, not named by --node, and not clean:")
+        for v in held:
+            lines.append("  %-*s  %-12s  %s" % (width, v.label, v.verdict,
+                                                v.reason))
     lines.append("")
-    lines.append("VERDICT: " + overall(verdicts))
+    lines.append("VERDICT: " + overall(verdicts, held, scoped))
     return lines
 
 
 def out_rows(verdicts):
     for v in verdicts:
+        host = v.label
+        if host.startswith(("=", "+", "-", "@", "\t", "\r")):
+            host = "'" + host  # a spreadsheet would run it as a formula
         yield {
-            "host": v.label,
+            "host": host,
             "verdict": v.verdict,
             "reason": v.reason,
             "baseline_old": "" if v.baseline_old is None else v.baseline_old,
@@ -473,7 +512,19 @@ def read_text(path):
 # ------------------------------------------------------------------ self-test
 
 def self_test():
-    """Assertions over the decision core and the CLI. No database, no network."""
+    """Assertions over the decision core and the CLI. No database, no network.
+
+    The CLI cases write fixture files to a temporary directory that this
+    function removes, also when an assertion raises.
+    """
+    tmp = tempfile.mkdtemp(prefix="sessorigin-")
+    try:
+        return _self_test(tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _self_test(tmp):
     passed = [0]
     failed = []
 
@@ -602,6 +653,24 @@ def self_test():
     check(gate([v]) == 3, "and UNSETTLED exits 3")
     v = one(series([(4, 0), (4, 0), (2, 2), (0, 4)]), settle=1)
     check(v.verdict == MIGRATED, "the same rounds at settle 1 are MIGRATED")
+    v = one(series([(4, 0), (4, 0), (0, 1), (0, 4), (0, 4)]), settle=3)
+    check(v.verdict == MIGRATED and v.reason == "0 on OLD and at least 1 on "
+          "NEW in each of the last 3 round(s)",
+          "the MIGRATED reason does not claim the last count for every round"
+          "  <-- pinned defect")
+    v = one(series([(4, 0), (4, 0), (0, 0), (0, 3)]))
+    check(v.verdict == UNSETTLED and v.reason.startswith(
+        "the last round is clean, but an earlier round of the last 2 was not"),
+        "a window round with no session on either server is UNSETTLED and "
+        "the reason blames that round  <-- pinned defect")
+    check(one(series([(1, 0)] * 4)).verdict == STAYED,
+          "one session left on OLD and none on NEW is STAYED, not GONE")
+    check(one(series([(4, 0), (4, 0), (0, 4), (0, 4)]).replace(
+        "DBNEW", "dbnew")).verdict == MIGRATED,
+        "a server name matches --new without case")
+    check(one(series([(4, 0), (4, 0), (0, 4), (0, 4)]).replace(
+        "DBOLD", "dbold")).verdict == MIGRATED,
+        "a server name matches --old without case")
     v = one(series([(4, 0), (0, 4), (1, 3), (0, 4)]))
     check(v.verdict == UNSETTLED,
           "a node that went back to OLD inside the window is UNSETTLED")
@@ -693,6 +762,9 @@ def self_test():
         "round,server,host_name", "ROUND, Server ,HOST_NAME")
     check(one(upper).verdict == MIGRATED,
           "column names match without case or surrounding blanks")
+    wide = series([(2, 0), (2, 0), (0, 2), (0, 2)]).replace("\n", ",x\n")
+    check(one(wide).verdict == MIGRATED,
+          "a column the tool does not know is ignored")
     typed = "#TYPE System.Data.DataRow\n" + series(
         [(2, 0), (2, 0), (0, 2), (0, 2)])
     check(one(typed).verdict == MIGRATED,
@@ -716,6 +788,14 @@ def self_test():
                   UsageError)
     check(msg.startswith("server(s) 'DBTHIRD', 'DBFOURTH' are on rows"),
           "a third server is refused, not dropped, and each name prints once")
+    check("repeated header row" not in msg,
+          "a third server gets no header hint")
+    msg = message(lambda: build_polls(parse_export(
+        series([(2, 0), (2, 0), (0, 2)]) + head), "DBOLD", "DBNEW"),
+        UsageError)
+    check("neither --old" in msg and "repeated header row" in msg,
+          "a header line repeated inside the export is named as the cause"
+          "  <-- pinned defect")
     no_old = head + poll(1, "DBNEW", [("app-01", 2)])
     msg = message(lambda: build_polls(parse_export(no_old), "DBOLD", "DBNEW"),
                   UsageError)
@@ -767,6 +847,20 @@ def self_test():
     check(gate(vs) == 3, "and one unseen node makes the run exit 3")
     check(overall(vs).startswith("NOT CERTIFIED. 1 of 2"),
           "and the run says NOT CERTIFIED")
+    polls, labels = build_polls(parse_export(both), "DBOLD", "DBNEW")
+    vs = assess(polls, labels, ["app-01"], 2)
+    held = not_clean(unjudged(polls, labels, vs, 2))
+    check(vs[0].verdict == MIGRATED and [(x.label, x.verdict) for x in held]
+          == [("app-02", SPLIT)],
+          "a host that --node leaves out, and that is split, is found")
+    check(gate(vs) == 0 and gate(vs, held) == 3,
+          "and it stops a MIGRATED run from exiting 0  <-- pinned defect")
+    check(overall(vs, held, True).startswith("NOT CERTIFIED. 1 host(s)") and
+          "MIGRATED" not in overall(vs, held, True),
+          "and the run line never says MIGRATED  <-- pinned defect")
+    check(overall(vs, (), True) == "MIGRATED. Every node named by --node is "
+          "on NEW and none is on OLD.",
+          "with nothing left out, a --node run says which nodes it judged")
     check(gate([]) == 3 and overall([]).startswith("INCONCLUSIVE"),
           "no node at all certifies nothing  <-- pinned defect")
     vs = verdicts(series([(4, 0), (4, 0), (4, 0)]).replace(
@@ -780,6 +874,15 @@ def self_test():
     check(rows[0]["split_rounds"] == "" and rows[0]["first_round_on_new"] == 3
           and rows[0]["final_old"] == 0,
           "the output row carries the counts and the first round on NEW")
+    sheet = [r["host"] for r in out_rows(verdicts(series(
+        [(2, 0), (2, 0), (0, 2), (0, 2)], host="=cmd|x")))]
+    check(sheet == ["'=cmd|x"],
+          "a host name that starts with = is written so a spreadsheet shows "
+          "it as text  <-- pinned defect")
+    check([r["host"] for r in out_rows(verdicts(series(
+        [(2, 0), (2, 0), (0, 2), (0, 2)], host="-x")))] == ["'-x"] and
+        rows[0]["host"] == "app-01",
+        "the other formula starters are guarded, and a plain name is not")
     rows = list(out_rows(verdicts(series([(0, 3), (0, 3), (0, 3)]))))
     check(rows[0]["baseline_old"] == 0 and rows[0]["final_old"] == "",
           "an INCONCLUSIVE row leaves the counts it never reached blank")
@@ -835,15 +938,13 @@ def self_test():
     check(hosts_lines("198.51.100.20\n", "198.51.100.20") == [],
           "a line with an address and no name maps nothing")
     ok, _ = preflight("db.example.test", "2001:db8::20", ["2001:DB8::20"])
-    check(ok, "IPv6 addresses compare as addresses, not as text")
+    check(ok, "ipv6 addresses compare as addresses, not as text")
     raises(lambda: preflight("a", "not-an-ip", ["192.0.2.1"]),
            "--expect that is not an address is a usage error", UsageError)
     raises(lambda: preflight("a", "192.0.2.1", ["db.example.test"]),
            "--resolved that is not an address is a usage error", UsageError)
 
     # ---- the CLI
-    tmp = tempfile.mkdtemp(prefix="sessorigin-")
-
     def tmpfile(name, text, mode="w"):
         path = os.path.join(tmp, name)
         if mode == "wb":
@@ -975,6 +1076,133 @@ def self_test():
           "a UTF-16 hosts file is refused, not read as having no line"
           "  <-- pinned defect")
 
+    # ---- --node leaves a host out
+    both_csv = tmpfile("both.csv", both)
+    code, out, err = run_cli([both_csv] + names + ["--node", "app-01"])
+    check(code == 3 and "VERDICT: NOT CERTIFIED. 1 host(s)" in out and
+          "VERDICT: MIGRATED" not in out and "app-02  SPLIT" in out,
+          "--node app-01 beside a split app-02 is not MIGRATED and exits 3"
+          "  <-- pinned defect")
+    code, out, err = run_cli([good_csv] + names + ["--node", "app-01"])
+    check(code == 0 and "Every node named by --node" in out,
+          "a --node run that leaves nothing out exits 0 and names its scope")
+    text = head
+    for r, (o, n) in enumerate([(4, 0), (4, 0), (0, 4), (0, 4)], 1):
+        text += poll(r, "DBOLD", [("app-01", o)] if o else [])
+        text += poll(r, "DBNEW", [("app-01", n), ("app-02", 2)])
+    other = tmpfile("other.csv", text)
+    code, out, err = run_cli([other] + names + ["--node", "app-01"])
+    check(code == 0 and "not clean" not in out and "VERDICT: MIGRATED" in out,
+          "a left-out host that was never on OLD does not block the run")
+
+    # ---- a host name the console cannot print
+    snow = "srv-\u2603"
+    snow_csv = tmpfile("snow.csv", series(
+        [(4, 0), (4, 0), (0, 4), (0, 4)], host=snow))
+    code, out, err = run_cli([snow_csv] + names)
+    check(code == 0 and "srv-\\u2603" in out and "\u2603" not in out,
+          "a non-ASCII host name prints as an escape, never as itself")
+    env = dict(os.environ, PYTHONIOENCODING="ascii")
+    proc = subprocess.run([sys.executable, os.path.abspath(__file__), snow_csv]
+                          + names, env=env, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE)
+    check(proc.returncode == 0 and b"srv-\\u2603" in proc.stdout and
+          b"Traceback" not in proc.stderr,
+          "an ASCII-only console gets the report, not a traceback and exit 1"
+          "  <-- pinned defect")
+    snow_bad = tmpfile("snowbad.csv", head + "\u2603,DBOLD,a,1,1,\n")
+    code, out, err = run_cli([snow_bad] + names)
+    check(code == 2 and "round '\\u2603'" in err,
+          "an error that quotes a cell escapes it too")
+
+    # ---- --out is never the file the run reads
+    before = open(good_csv, "rb").read()
+    code, out, err = run_cli([good_csv] + names + ["--out", good_csv,
+                                                   "--apply"])
+    check(code == 64 and "must not be the file the run reads" in err and
+          open(good_csv, "rb").read() == before,
+          "--out naming the export is refused and the export is untouched"
+          "  <-- pinned defect")
+    code, out, err = run_cli([good_csv] + names + ["--out", good_csv])
+    check(code == 64, "and the refusal does not wait for --apply")
+    code, out, err = run_cli([good_csv] + names + pre + [
+        "--resolved", "198.51.100.20", "--node", "app-01", "--out", hosts_txt,
+        "--apply"])
+    check(code == 64 and "must not be the file the run reads" in err,
+          "--out naming the hosts file is refused too")
+    gone = os.path.join(tmp, "gone.csv")
+    code, out, err = run_cli([gone] + names + ["--out", gone])
+    check(code == 64 and "must not" in err,
+          "two spellings of one missing path are the same file")
+
+    # ---- the outputs this README shows, line for line
+    def stamped(rounds, blind=()):
+        text = head
+        for r, (o1, n1, o2, n2) in enumerate(rounds, 1):
+            t = "2026-01-05 10:0%d:00.0000000" % (r - 1)
+            text += poll(r, "DBOLD", [("app-01", o1), ("app-02", o2)],
+                         vss="0" if r in blind else "1", t=t)
+            text += poll(r, "DBNEW", [("app-01", n1), ("app-02", n2)], t=t)
+        return text
+
+    def shown(name, text, extra=()):
+        """The printed lines of one run, without the line that names the file."""
+        path = tmpfile(name, text)
+        return run_cli([path] + names + list(extra))[1].splitlines()[1:]
+
+    t3 = "2026-01-05 10:02:00.0000000"
+    t6 = "2026-01-05 10:05:00.0000000"
+    pad = " " * 24
+    rehearsal = [(4, 0, 4, 0), (4, 0, 4, 0), (2, 2, 2, 2), (0, 4, 2, 2),
+                 (0, 4, 2, 2), (0, 4, 2, 2)]
+    split = [
+        "  app-02  SPLIT         2 session(s) still on OLD and 2 on NEW in "
+        "round 6",
+        pad + "split in 4 round(s): 3-6, from %s to %s" % (t3, t6)]
+    app01 = [
+        "  app-01  MIGRATED      0 on OLD and at least 4 on NEW in each of "
+        "the last 2 round(s)",
+        pad + "passed through a split in 1 round(s): 3, at %s" % t3]
+    check(shown("rehearsal.csv", stamped(rehearsal)) == [
+        "rounds 1-6, OLD = DBOLD, NEW = DBNEW, settle 2"] + app01 + [
+        split[0], split[1], "",
+        "VERDICT: SPLIT. 1 node(s) answer from both databases. This is not a "
+        "migration."], "the README rehearsal run prints exactly what it shows")
+    restarted = rehearsal + [(0, 4, 0, 4)] * 2
+    app02 = [
+        "  app-02  MIGRATED      0 on OLD and at least 4 on NEW in each of "
+        "the last 2 round(s)",
+        pad + "passed through a split in 4 round(s): 3-6, from %s to %s"
+        % (t3, t6)]
+    check(shown("after-restart.csv", stamped(restarted)) == [
+        "rounds 1-8, OLD = DBOLD, NEW = DBNEW, settle 2"] + app01 + app02 + [
+        "", "VERDICT: MIGRATED. Every node is on NEW and none is on OLD."],
+        "the README after-restart run prints exactly what it shows")
+    why = ("round 7: the poll of OLD could not see other sessions "
+           "(view_server_state is not 1), so its zero proves nothing")
+    check(shown("blind.csv", stamped(restarted, blind=(7,))) == [
+        "rounds 1-8, OLD = DBOLD, NEW = DBNEW, settle 2",
+        "  app-01  INCONCLUSIVE  " + why,
+        pad + "split in 1 round(s): 3, at %s" % t3,
+        "  app-02  INCONCLUSIVE  " + why,
+        pad + "split in 4 round(s): 3-6, from %s to %s" % (t3, t6), "",
+        "VERDICT: NOT CERTIFIED. 2 of 2 node(s) cannot be called migrated."],
+        "the README blind run prints exactly what it shows")
+    fail = [
+        "hosts file: line 3 maps db.example.test to 198.51.100.20",
+        "PREFLIGHT FAIL  the hosts edit is on disk and not in effect: the "
+        "file maps db.example.test to 198.51.100.20, and the resolver still "
+        "answers 192.0.2.10.",
+        "  A session verdict now would test the old address, not the flip."]
+    check(run_cli(pre + ["--resolved", "192.0.2.10"])[1].splitlines() == fail,
+          "the README preflight run prints exactly what it shows")
+    rehearsal_csv = tmpfile("rehearsal.csv", stamped(rehearsal))
+    check(run_cli([rehearsal_csv] + names + pre + [
+        "--resolved", "192.0.2.10", "--node", "app-02"])[1].splitlines() ==
+        fail + ["", "Session verdicts withheld: the node never resolved the "
+                "alias to the new address."],
+        "the README withheld run prints exactly what it shows")
+
     argv_before = sys.argv
     try:
         sys.argv = ["sessorigin.py", good_csv] + names
@@ -1020,7 +1248,6 @@ def self_test():
           "FAILED: probe label" in report,
           "a run with a failure says so and returns 1")
 
-    shutil.rmtree(tmp, ignore_errors=True)
     return _summary(passed[0] + len(failed), failed)
 
 
@@ -1038,12 +1265,30 @@ def _summary(total, failed):
 
 # ----------------------------------------------------------------------- cli
 
+def _say(text="", stream=None):
+    """Print text any console can show: each non-ASCII character is escaped.
+
+    host_name is client-supplied. A name the console cannot encode must not
+    crash the report with exit 1, the exit code that means SPLIT or STAYED.
+    """
+    print(text.encode("ascii", "backslashreplace").decode("ascii"),
+          file=stream or sys.stdout)
+
+
+def _same_path(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(
+            os.path.abspath(b))
+
+
 def _parse(argv):
     ap = argparse.ArgumentParser(
         prog="sessorigin.py",
         description="Give a verdict from exported session rows after a "
                     "database alias flip. Never reports MIGRATED in a split.",
-        epilog="Nothing is written without --apply.",
+        epilog="Outside --self-test, nothing is written without --apply.",
         allow_abbrev=False,
     )
     ap.add_argument("sessions", nargs="?", metavar="SESSIONS",
@@ -1084,6 +1329,9 @@ def _usage(args):
         return "--apply needs --out"
     if args.out and not args.sessions:
         return "--out needs a session export"
+    for other in (args.sessions, args.hosts_file):
+        if other and args.out and _same_path(args.out, other):
+            return "--out must not be the file the run reads: %s" % other
     if args.sessions:
         if not args.old or not args.new:
             return "a session export needs --old and --new"
@@ -1105,7 +1353,7 @@ def main(argv=None):
 
     problem = _usage(args)
     if problem:
-        print("error: %s" % problem, file=sys.stderr)
+        _say("error: %s" % problem, sys.stderr)
         return 64
 
     try:
@@ -1114,34 +1362,36 @@ def main(argv=None):
             passed, lines = preflight(args.alias, args.expect, args.resolved,
                                       hosts_text)
             for line in lines:
-                print(line)
+                _say(line)
             if not args.sessions:
                 return 0 if passed else 3
             if not passed:
-                print("\nSession verdicts withheld: the node never resolved "
-                      "the alias to the new address.")
+                _say("\nSession verdicts withheld: the node never resolved "
+                     "the alias to the new address.")
                 return 3
-            print("")
+            _say("")
         records = parse_export(read_text(args.sessions))
         polls, labels = build_polls(records, args.old, args.new)
     except UsageError as exc:
-        print("error: %s" % exc, file=sys.stderr)
+        _say("error: %s" % exc, sys.stderr)
         return 64
     except (BadInput, IOError, OSError, csv.Error) as exc:
         # csv.Error too: a field over csv's 131072 character limit is an
         # unreadable input, not a verdict.
-        print("error: %s" % exc, file=sys.stderr)
+        _say("error: %s" % exc, sys.stderr)
         return 2
 
     verdicts = assess(polls, labels, args.node, args.settle)
-    print("sessorigin: %s" % args.sessions)
-    for line in describe(verdicts, polls, args.old, args.new, args.settle):
-        print(line)
+    held = not_clean(unjudged(polls, labels, verdicts, args.settle))
+    _say("sessorigin: %s" % args.sessions)
+    for line in describe(verdicts, polls, args.old, args.new, args.settle,
+                         held, bool(args.node)):
+        _say(line)
 
     if args.out:
         if not args.apply:
-            print("\nCheck only. %s was not written. Re-run with --apply."
-                  % args.out)
+            _say("\nCheck only. %s was not written. Re-run with --apply."
+                 % args.out)
         else:
             try:
                 with open(args.out, "w", newline="",
@@ -1151,12 +1401,12 @@ def main(argv=None):
                     writer.writeheader()
                     writer.writerows(out_rows(verdicts))
             except (IOError, OSError) as exc:
-                print("error: could not write %s: %s" % (args.out, exc),
-                      file=sys.stderr)
+                _say("error: could not write %s: %s" % (args.out, exc),
+                     sys.stderr)
                 return 2
-            print("\nwrote %s" % args.out)
+            _say("\nwrote %s" % args.out)
 
-    return gate(verdicts)
+    return gate(verdicts, held)
 
 
 if __name__ == "__main__":

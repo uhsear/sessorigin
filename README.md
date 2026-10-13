@@ -45,26 +45,32 @@ PASS  a hosts line on disk while the resolver answers the old address FAILS  <--
 PASS  a prefix --ap of --apply is refused by the parser  <-- pinned defect
 PASS  a prefix --appl of --apply is refused by the parser  <-- pinned defect
 ...
+PASS  --node app-01 beside a split app-02 is not MIGRATED and exits 3  <-- pinned defect
+PASS  an ASCII-only console gets the report, not a traceback and exit 1  <-- pinned defect
+PASS  --out naming the export is refused and the export is untouched  <-- pinned defect
+...
 PASS  a failed preflight withholds every session verdict  <-- pinned defect
 PASS  and a withheld run writes nothing, even with --apply  <-- pinned defect
 ...
 PASS  loading the file as a module runs nothing and prints nothing
 PASS  a run with a failure says so and returns 1
 --------------------------------------------------------------------
-110 assertions, 0 failed
+139 assertions, 0 failed
 ```
 
-The full run prints all 110 assertions. The `...` lines show where this block is cut.
+The full run prints all 139 assertions. The `...` lines show where this block is cut.
 
 ## Requirements
 
 Python 3.9 or newer, and nothing else. No database driver, no third-party package, no network.
 The tool reads a CSV that you export from both servers.
 
-The self-test prints 110 assertions, 0 failed, on each of these interpreters: Windows Python
-3.13.2, Windows Python 3.9.25, and Ubuntu Python 3.12.3. The Windows and Ubuntu outputs are
-identical line for line. Branch coverage of the self-test is 100 percent (698 statements, 190
-branches, measured with coverage.py 7.16.1).
+The self-test prints 139 assertions, 0 failed, on each of these interpreters: Windows Python
+3.13.2, Windows Python 3.9.25, and Ubuntu Python 3.12.3. The outputs are identical line for line.
+Branch coverage of the self-test is 100 percent (814 statements, 210 branches, measured with
+coverage.py 7.16.1 on Windows). The self-test starts one subprocess, to prove that a console
+which cannot print non-ASCII text still gets the report. Coverage does not trace that
+subprocess, and the same lines run in the test process.
 
 ```
 git clone https://github.com/uhsear/sessorigin.git
@@ -94,8 +100,14 @@ python sessorigin.py polls.csv --old DBOLD --new DBNEW --out verdicts.csv --appl
 | `--resolved` | none | Preflight: an address the node's resolver returned. Repeat it for each address. |
 | `--hosts-file` | none | Preflight: a copy of the node's hosts file. Optional. |
 | `--out` | off | Write one row per node to this CSV. Needs `--apply`. |
-| `--apply` | off | Write `--out`. Without it, nothing is written. |
-| `--self-test` | off | Run the assertions and exit. |
+| `--apply` | off | Write `--out`. Without it, no file is written. |
+| `--self-test` | off | Run the assertions and exit. It writes fixture files to a temporary directory and removes the directory. |
+
+`--node` limits the verdicts, not the check. The tool still judges every other host in the
+export. If one of them is `SPLIT`, `STAYED` or `UNSETTLED`, the run prints it under "not clean",
+says `NOT CERTIFIED`, and exits 3 instead of 0. A run that leaves nothing out ends with "Every
+node named by --node". A run without `--node` ends with "Every node", which means every host in
+the export.
 
 The parser sets `allow_abbrev=False`. A prefix such as `--ap` is refused, and it is never read
 as `--apply`. The self-test pins this for `--ap` and `--appl`.
@@ -111,7 +123,8 @@ the Microsoft documentation cited below. **It has not been run against a SQL Ser
 repository's tests.** The tool's tests start from the CSV.
 
 ```sql
--- One round, one server. $(round) is a sqlcmd scripting variable: sqlcmd -v round=3
+-- One round, one server. $(round) is a scripting variable that
+-- Invoke-Sqlcmd sets with -Variable "round=3".
 SELECT $(round)                                            AS round,
        @@SERVERNAME                                        AS server,
        s.host_name,
@@ -121,8 +134,14 @@ SELECT $(round)                                            AS round,
 FROM (SELECT 1 AS one) AS p
 LEFT JOIN sys.dm_exec_sessions AS s
        ON s.is_user_process = 1
+      AND s.session_id <> @@SPID
       AND s.host_name IN ('app-01', 'app-02');
 ```
+
+Run the query with `Invoke-Sqlcmd` and pipe the rows to `Export-Csv`. Run it from a machine whose
+`host_name` is not in the `IN` list. The `session_id <> @@SPID` line leaves out the poll's own
+session. A poller whose `host_name` is in the list would count as a node on both servers, and
+every run would stop at the baseline with `INCONCLUSIVE`.
 
 | Column | Required | What the tool does with it |
 |---|---|---|
@@ -141,7 +160,13 @@ Column names match without case and without surrounding blanks. Windows PowerShe
 `Export-Csv` writes a `#TYPE` line above the header unless you give `-NoTypeInformation`. The
 tool skips that line. `Export-Csv` converts each value with `ToString()`, and `DBNull.ToString()`
 returns an empty string, so a SQL `NULL` arrives as a blank cell. A UTF-8 BOM is stripped. A
-UTF-16 file is refused with exit 2, because reading it as UTF-8 gives no usable column.
+UTF-16 file is refused with exit 2, because reading it as UTF-8 gives no usable column. A column
+that the tool does not know is ignored.
+
+Only `Invoke-Sqlcmd` with `Export-Csv` is supported. The `sqlcmd` program prints the text `NULL`
+for a `NULL` cell and a row of dashes under the header. The tool then reads a node called `NULL`,
+or a server called `------`. Both fail closed: the first exits 3 and the second exits 64. If you
+use `sqlcmd`, remove the dashes row, add the header yourself, and blank the `NULL` cells.
 
 ## What a blind poll is
 
@@ -156,11 +181,11 @@ change the permission name in `HAS_PERMS_BY_NAME`.
 
 | Verdict | Condition, at the last round | Exit |
 |---|---|---|
-| `MIGRATED` | 0 on OLD and at least 1 on NEW, in each of the last `--settle` rounds. | 0 |
+| `MIGRATED` | 0 on OLD and at least 1 on NEW, in each of the last `--settle` rounds. The reason quotes the lowest NEW count in the window. | 0 |
 | `SPLIT` | At least 1 on OLD and at least 1 on NEW. | 1 |
 | `STAYED` | At least 1 on OLD and 0 on NEW. The pool did not follow the alias. | 1 |
 | `GONE` | 0 on both servers. The node left OLD and nothing proves it arrived. | 3 |
-| `UNSETTLED` | 0 on OLD in the last round, but not in every round of the window. | 3 |
+| `UNSETTLED` | The last round is clean, but an earlier round of the window was not 0 on OLD with at least 1 on NEW. | 3 |
 | `INCONCLUSIVE` | Too few rounds, a missing or blind poll, or no warm baseline. | 3 |
 
 The baseline must show the node on OLD and not on NEW. A node with no session on OLD at baseline
@@ -174,7 +199,7 @@ through one split round, and `app-02` kept two sessions on OLD to the end:
 $ python sessorigin.py rehearsal.csv --old DBOLD --new DBNEW
 sessorigin: rehearsal.csv
 rounds 1-6, OLD = DBOLD, NEW = DBNEW, settle 2
-  app-01  MIGRATED      0 on OLD and 4 on NEW in each of the last 2 round(s)
+  app-01  MIGRATED      0 on OLD and at least 4 on NEW in each of the last 2 round(s)
                         passed through a split in 1 round(s): 3, at 2026-01-05 10:02:00.0000000
   app-02  SPLIT         2 session(s) still on OLD and 2 on NEW in round 6
                         split in 4 round(s): 3-6, from 2026-01-05 10:02:00.0000000 to 2026-01-05 10:05:00.0000000
@@ -188,9 +213,9 @@ After a full restart of the service, two more rounds show both nodes only on NEW
 $ python sessorigin.py after-restart.csv --old DBOLD --new DBNEW
 sessorigin: after-restart.csv
 rounds 1-8, OLD = DBOLD, NEW = DBNEW, settle 2
-  app-01  MIGRATED      0 on OLD and 4 on NEW in each of the last 2 round(s)
+  app-01  MIGRATED      0 on OLD and at least 4 on NEW in each of the last 2 round(s)
                         passed through a split in 1 round(s): 3, at 2026-01-05 10:02:00.0000000
-  app-02  MIGRATED      0 on OLD and 4 on NEW in each of the last 2 round(s)
+  app-02  MIGRATED      0 on OLD and at least 4 on NEW in each of the last 2 round(s)
                         passed through a split in 4 round(s): 3-6, from 2026-01-05 10:02:00.0000000 to 2026-01-05 10:05:00.0000000
 
 VERDICT: MIGRATED. Every node is on NEW and none is on OLD.
@@ -210,8 +235,9 @@ rounds 1-8, OLD = DBOLD, NEW = DBNEW, settle 2
 VERDICT: NOT CERTIFIED. 2 of 2 node(s) cannot be called migrated.
 ```
 
-These runs read synthetic CSV files that are not shipped. The self-test builds its own copies of
-every case in this section.
+These runs read synthetic CSV files that are not shipped. The self-test builds each of these
+exports, runs the tool on it, and compares every printed line with the lines shown here. Only the
+line that names the file differs. It does the same for both preflight runs in the next section.
 
 ## The preflight
 
@@ -274,7 +300,10 @@ on the node cleared the old server. The runbook changed in two places:
    feature count or a REST check is a liveness check, not a cutover check.
 
 This tool is the second step, with the trap closed: a node with sessions on both servers is
-never called migrated. [svcguard](https://github.com/uhsear/svcguard) handles the first step.
+never called migrated. The restart in the first step uses the operating system's service manager
+on each node. This tool does not do it. [svcguard](https://github.com/uhsear/svcguard) stops and
+starts single services through the Admin API, which is the per-service recycle that left sessions
+behind here, so it is not a substitute for the node restart.
 
 ## Existing tools
 
@@ -285,9 +314,10 @@ and login, and it filters by `-Hostname`. Both show you live sessions on one ser
 this tool does, and with much more detail. Neither compares two servers over time, and neither
 gives a verdict. The raw DMV gives the same rows with no verdict.
 
-On 2026-10-09, `gh search repos` returned no repository for `sessorigin`, for "alias flip sql
-sessions", for "dm_exec_sessions cutover", or for "split brain dns alias sql server". That shows
-only that those searches found nothing.
+On 2026-10-09, before this repository was public, `gh search repos` returned no repository for
+`sessorigin`, for "alias flip sql sessions", for "dm_exec_sessions cutover", or for "split brain
+dns alias sql server". On 2026-10-13 the same searches return only this repository, for its own
+name. That shows only what those searches found.
 
 ## Exit codes
 
@@ -295,12 +325,13 @@ only that those searches found nothing.
 |---|---|
 | 0 | Every node is `MIGRATED`, or a preflight run on its own passed. |
 | 1 | At least one node is `SPLIT` or `STAYED`: sessions remain on the old server. |
-| 2 | A file could not be read or written, or a row is malformed. argparse also exits 2 for an unknown flag, such as `--ap`. |
-| 3 | Nothing is certified: `GONE`, `UNSETTLED`, `INCONCLUSIVE`, no node at all, or a failed preflight. |
-| 64 | Usage error, including a server name or a column that is not in the export. |
+| 2 | A file could not be read or written, or a row is malformed. argparse also exits 2 for an unknown flag, such as `--ap`, and for a bad value, such as `--settle abc`. |
+| 3 | Nothing is certified: `GONE`, `UNSETTLED`, `INCONCLUSIVE`, no node at all, a failed preflight, or a host that `--node` left out and that still shows sessions on OLD. |
+| 64 | Usage error, including a server name or a column that is not in the export, and an `--out` that names a file the run reads. |
 
 Exit 1 is above exit 3 when both apply. A split node needs action now. An unproven node needs
-another round of polls.
+another round of polls. An uncaught Python error also exits 1, so read stderr when exit 1 comes
+with no `VERDICT` line.
 
 ## Limits
 
@@ -319,8 +350,42 @@ another round of polls.
 - `--settle 2` is a default, not a standard. One round of zero can fall between two recycled
   connections.
 - It reads ASCII or UTF-8 only. UTF-16 files are refused.
-- Nothing is written without `--apply`, and a withheld run writes nothing. It opens no socket,
-  and it holds no credential.
+- Outside `--self-test`, nothing is written without `--apply`, and a withheld run writes
+  nothing. The self-test writes fixture files to a temporary directory and removes it. The tool
+  opens no socket and holds no credential.
+- "Every node" means every host in the export. A node that the export query's host filter left
+  out is never judged. Name the full set with `--node`, or widen the filter.
+- `--out` replaces an existing file without asking, and the write is not atomic. A failure in the
+  middle leaves a short file. The tool refuses an `--out` that names the export or the hosts
+  file.
+- The `--out` file is UTF-8 and holds the host name as the export spells it. A name that starts
+  with `=`, `+`, `-` or `@` gets a leading quote, so a spreadsheet shows it as text. Treat
+  `host_name` as untrusted text anyway.
+- Printed text escapes every non-ASCII character as `\uXXXX` (or `\UXXXXXXXX`), so a console that cannot encode a
+  host name still gets the report. A file that is not UTF-8 decodes with replacement characters.
+- Error messages quote the cell that caused them. Do not share them from an export that holds
+  more than poll rows.
+- An uncaught Python error exits 1, the same code as `SPLIT` and `STAYED`. Read stderr when exit 1
+  comes with no `VERDICT` line.
+- A CSV cut off in the middle of a poll is not detected, because a poll has no end marker. If the
+  rows of OLD for one node are cut off and the rest of that poll survives, the poll still counts
+  as read, and the node can read as `MIGRATED`. Check that the export is whole before you trust a
+  verdict.
+- Rounds are the whole numbers that Python `int()` accepts, so `01` and `1` are one round, and
+  `1_0` is round 10. Rows that repeat a round are merged, so a poll appended twice can add
+  sessions that have since closed. That errs toward `SPLIT` or `INCONCLUSIVE`.
+- The settle window is the last `--settle` rounds that are present, not consecutive round
+  numbers. A gap such as 1, 2, 50 is not detected.
+- A hosts line that names the alias with a trailing dot (`db.example.test.`) does not match. An
+  IPv4-mapped IPv6 answer (`::ffff:198.51.100.20`) does not equal the IPv4 address. A hosts line
+  with an IPv6 zone id, such as `fe80::1%eth0`, reads as not an address on Python 3.9. All three
+  fail the preflight, which is the safe direction.
+- A header line that joins two exports is refused. The error names a repeated header row only
+  when the server cell is blank or reads `server`.
+- Sessions count per client `host_name`. Any process that connects from that name counts as the
+  node, not only ArcGIS Server.
+- The search for an equivalent tool found none on 2026-10-09, and finds only this repository
+  for its own name now. That is not proof that none exists.
 
 ## Sources
 
@@ -329,10 +394,14 @@ another round of polls.
   `host_name`, and the permissions ("Everyone can see their own session information").
 - [HAS_PERMS_BY_NAME](https://learn.microsoft.com/en-us/sql/t-sql/functions/has-perms-by-name-transact-sql):
   returns 1 or 0, and example A checks `VIEW SERVER STATE` with `NULL, NULL`.
+- [@@SPID](https://learn.microsoft.com/en-us/sql/t-sql/functions/spid-transact-sql):
+  returns the session ID of the current user process.
+- [Invoke-Sqlcmd](https://learn.microsoft.com/en-us/powershell/module/sqlserver/invoke-sqlcmd):
+  the `-Variable` parameter sets sqlcmd scripting variables for the script.
 - [@@SERVERNAME](https://learn.microsoft.com/en-us/sql/t-sql/functions/servername-transact-sql):
   the name of the local server that runs SQL Server.
 - [sqlcmd scripting variables](https://learn.microsoft.com/en-us/sql/tools/sqlcmd/sqlcmd-use-scripting-variables):
-  `-v name=value` and `$(name)`.
+  the `$(name)` form.
 - [Export-Csv](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/export-csv):
   the `#TYPE` header is the default before PowerShell 6.0, and values convert with `ToString()`.
 - [DBNull.ToString](https://learn.microsoft.com/en-us/dotnet/api/system.dbnull.tostring):
@@ -360,10 +429,11 @@ MIT.
 
 Other single-file tools in this portfolio that pair with this one:
 
-- [svcguard](https://github.com/uhsear/svcguard) - restart an ArcGIS Server service around risky
-  maintenance, even on failure. The full restart is what cleared the split here.
+- [svcguard](https://github.com/uhsear/svcguard) - stop and start single ArcGIS Server services
+  around risky maintenance, even on failure. It works per service, so it is not the node-wide
+  restart that cleared the split here.
 - [svcsource](https://github.com/uhsear/svcsource) - report the database and instance behind
-  every service. Run it to find which nodes and services read through the alias.
+  every service. It names the database a service reads, not the nodes that serve it.
 - [stalehost](https://github.com/uhsear/stalehost) - find every ArcGIS file that still names the
   host you are retiring.
 - [compressfloor](https://github.com/uhsear/compressfloor) - the same exported-rows pattern,
